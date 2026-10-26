@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# User media and generated subtitles (keep the folders themselves)
+INPUT/*
+!INPUT/.gitkeep
+OUTPUT/*
+!OUTPUT/.gitkeep
+
+# Personal context / glossary files
+context.txt
+glossary.txt
+glossary.json
+*.context.txt
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

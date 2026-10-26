@@ -1,0 +1,6 @@
+# PyTorch is installed separately by setup.sh (ROCm / CUDA / CPU build).
+openai-whisper>=20240930
+ollama>=0.4
+pysrt>=1.1.2
+webvtt-py>=0.5
+charset-normalizer>=3.0
