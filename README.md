@@ -1,12 +1,16 @@
 # SubTranslate
 
-**Offline English subtitles for anime (and other foreign-language video), generated entirely on your own machine.**
+**Offline English subtitles for anime and YouTube stream VODs (with synchronized live chat), generated entirely on your own machine.**
 
-SubTranslate pulls subtitles out of video files, or transcribes the audio with [OpenAI Whisper](https://github.com/openai/whisper). It then translates the dialogue to natural English with a local LLM running in [Ollama](https://ollama.com). The output is standard SubRip (`.srt`) files that work in any video player.
+SubTranslate pulls subtitles out of video files, transcribes the audio with [OpenAI Whisper](https://github.com/openai/whisper), or translates YouTube stream VOD live chat logs (`*.live_chat.json`). It then translates dialogue and live chat to natural English with a local LLM running in [Ollama](https://ollama.com).
+
+The output includes standard SubRip (`.srt`) subtitles, translated JSON replay logs (`*.en.live_chat.json`), and ready-to-play styled ASS chat sidebar overlays (`*.chat.en.ass`) that work in any video player.
 
 - 🔒 **100% local.** No cloud APIs and no accounts. Your media never leaves your machine.
-- 🎌 **Built for anime.** Reads the whole episode first, then keeps character voices, honorifics, and terminology consistent.
-- 🧠 **Context-aware translation.** Each batch also sees the lines before and after it, so sentences split across cues still read correctly.
+- 🎌 **Built for anime & livestream culture.** Understands streamer nicknames, honorifics, and live chat slang (`w`/`草`, `てぇてぇ`, `待機`, `赤スパ`, `8888`).
+- 💬 **YouTube VOD Live Chat support.** Translates `yt-dlp` `*.live_chat.json` replays and generates a synchronized, non-overlapping scrolling chat overlay.
+- 🧠 **Context-aware translation.** Each batch sees the dialogue or chat before and after it for natural continuity.
+- 🤔 **Thinking model support.** Fully compatible with reasoning models (e.g. `gemma4:31b`, `qwen3:32b`) without token truncation.
 - 🛡️ **Self-checking.** Missing, untranslated, or runaway lines are detected and re-translated automatically.
 - ⚡ **GPU accelerated.** Supports AMD (ROCm), NVIDIA (CUDA), or plain CPU.
 
@@ -78,9 +82,10 @@ Finished subtitles appear in `OUTPUT/`.
 ### Process a single file
 
 ```bash
-./run.sh episode01.mkv                    # looks in INPUT/ first
-./run.sh /any/path/episode01.mkv          # or give a full path
-./run.sh episode01.mkv --ignore-subs      # extra flags are passed through
+./run.sh episode01.mkv                           # looks in INPUT/ first
+./run.sh vod.live_chat.json                      # translate a YouTube stream chat log
+./run.sh /any/path/episode01.mkv                 # or give a full path
+./run.sh episode01.mkv --ignore-subs             # extra flags are passed through
 ```
 
 ### Output file naming
@@ -90,6 +95,53 @@ Finished subtitles appear in `OUTPUT/`.
 | `episode01.mkv` | `OUTPUT/episode01.srt`: English subtitles |
 | | `OUTPUT/episode01.original.srt`: original-language transcript |
 | `video.ja.srt` | `OUTPUT/video.ja.en.srt`: English subtitles |
+| `stream.live_chat.json` | `OUTPUT/stream.en.live_chat.json`: translated JSON replay log (preserves badges, custom emotes, Super Chat colors) |
+| | `OUTPUT/stream.chat.en.ass`: synchronized scrolling chat overlay for any video player |
+
+---
+
+## Watching Stream VODs with Synchronized Chat (Linux)
+
+### 1. Download the VOD and Live Chat with `yt-dlp`
+
+```bash
+yt-dlp --write-subs --sub-langs live_chat "https://www.youtube.com/watch?v=..."
+```
+
+This saves:
+- `video [VIDEO_ID].mp4` (or `.mkv`)
+- `video [VIDEO_ID].live_chat.json`
+
+### 2. Translate with SubTranslate
+
+Copy `*.live_chat.json` into `INPUT/` (or run directly with `./run.sh`):
+
+```bash
+./run.sh "video [VIDEO_ID].live_chat.json"
+```
+
+SubTranslate produces:
+- `OUTPUT/video [VIDEO_ID].chat.en.ass`: styled scrolling sidebar overlay with user badge colors and Super Chats.
+- `OUTPUT/video [VIDEO_ID].en.live_chat.json`: translated native YouTube JSONL log.
+
+*(Tip: If you place both the video and the chat log in `INPUT/`, SubTranslate automatically combines spoken dialogue subtitles at the bottom and scrolling live chat on the right into a single `.chat.en.ass` track!)*
+
+### 3. Play Synchronized in `mpv`
+
+#### Option A: Zero plugins (works in `mpv` and VLC immediately)
+```bash
+mpv "video.mp4" --sub-file="OUTPUT/video.chat.en.ass"
+```
+
+To display **both** spoken dialogue at the bottom and scrolling live chat on the side simultaneously:
+```bash
+mpv "video.mp4" --sub-file="OUTPUT/video.srt" --secondary-sub-file="OUTPUT/video.chat.en.ass"
+```
+
+#### Option B: Native YouTube chat UI inside `mpv`
+Install the popular [`mpv-youtube-chat`](https://github.com/BanchouBoo/mpv-youtube-chat) Lua script (`~/.config/mpv/scripts/youtube-chat.lua`). It automatically detects and renders `.live_chat.json` alongside your video. Rename or symlink `OUTPUT/video.en.live_chat.json` next to your video file to view the translated chat with avatars and emote animations!
+
+---
 
 ## Command-Line Options
 
@@ -98,23 +150,26 @@ All options work with both `./run.sh` and `python subtranslate.py`.
 | Option | Description | Default |
 |:---|:---|:---|
 | `-f`, `--file <path>` | Process a specific file or directory | `INPUT/` |
-| `-o`, `--output-dir <path>` | Where to write subtitles | `OUTPUT/` |
+| `-o`, `--output-dir <path>` | Where to write subtitles and chat files | `OUTPUT/` |
 | `-w`, `--whisper-model <name>` | Whisper model (`tiny`, `base`, `small`, `medium`, `large-v3`, `turbo`) | `large-v3` |
 | `-m`, `--ollama-model <name>` | Ollama translation model | `qwen2.5:14b` |
 | `-b`, `--batch-size <n>` | Subtitle lines per translation request | `20` |
+| `--chat-batch-size <n>` | Live chat messages per translation request | `35` |
+| `--think <mode>` | Thinking mode for reasoning LLMs (`auto`, `off`, `on`, `low`, `medium`, `high`) | `auto` |
 | `-l`, `--language <code>` | Force the source language (`ja`, `ko`, `zh`, …) | auto-detect |
 | `-i`, `--ignore-subs` | Ignore embedded subtitle tracks and always use Whisper | off |
-| `--transcribe-only` | Only transcribe media files, skip translation | off |
-| `--translate-only` | Only translate subtitle files, skip media files | off |
+| `--transcribe-only` | Only transcribe media / build raw ASS chat overlay, skip LLM translation | off |
+| `--translate-only` | Only translate subtitle or live chat files, skip media files | off |
 | `--version` | Print the version and exit | |
 
 Examples:
 
 ```bash
-./run.sh --whisper-model medium           # faster, less VRAM
-./run.sh --ollama-model aya-expanse:8b    # alternate translation model
-./run.sh --language ja                    # skip language auto-detection
-./run.sh video.mp4 --transcribe-only      # original-language subtitles only
+./run.sh --whisper-model medium              # faster, less VRAM
+./run.sh --ollama-model gemma4:31b           # high-accuracy reasoning model
+./run.sh --think off                         # disable reasoning tokens if not needed
+./run.sh stream.live_chat.json               # translate stream chat
+./run.sh video.mp4 --transcribe-only         # original-language subtitles only
 ```
 
 ## Supported Formats
@@ -124,6 +179,9 @@ Examples:
 
 **Subtitles** (translation only):
 `.srt` (SubRip), `.ass` / `.ssa` (SubStation Alpha), `.vtt` (WebVTT)
+
+**Stream Live Chat** (translation and ASS overlay rendering):
+`*.live_chat.json`, `*.live_chat.jsonl` (yt-dlp format)
 
 Subtitle files in UTF-8, UTF-16, Shift-JIS, GBK, and other legacy encodings are detected automatically.
 

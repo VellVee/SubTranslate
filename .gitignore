@@ -16,6 +16,8 @@ glossary.txt
 glossary.json
 *.context.txt
 
+glossary.example.txt
+
 # Editor / OS
 .vscode/
 .idea/

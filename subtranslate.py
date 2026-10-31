@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-SubTranslate — Local Anime Subtitle Generator
+SubTranslate — Local Anime & Stream VOD Subtitle/Chat Translator
 
-Transcribes audio from media files using Whisper and translates
-subtitles to English using a local LLM via Ollama.
+Transcribes audio from media files using Whisper and translates subtitles
+or YouTube VOD live chat logs (*.live_chat.json) to English using a local
+LLM via Ollama.
 
 Usage:
-    python subtranslate.py                          # Process all files in INPUT/
-    python subtranslate.py --file INPUT/ep01.mkv    # Process specific file
-    python subtranslate.py --whisper-model medium    # Use smaller Whisper model
-    python subtranslate.py --ollama-model llama3.2   # Use different Ollama model
+    python subtranslate.py                              # Process all files in INPUT/
+    python subtranslate.py --file INPUT/ep01.mkv        # Process specific video
+    python subtranslate.py --file INPUT/vod.live_chat.json  # Translate YT VOD live chat
+    python subtranslate.py --whisper-model medium       # Use smaller Whisper model
+    python subtranslate.py --ollama-model gemma4:31b    # Use different Ollama model
 """
 
 import argparse
+import copy
 import json
 import re
 import shutil
@@ -20,16 +23,19 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+import unicodedata
+import zlib
+from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 
 # ── Configuration ───────────────────────────────────────────────────────────
 
 MEDIA_EXTENSIONS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".m4v", ".ts", ".wmv"}
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
+LIVE_CHAT_SUFFIXES = (".live_chat.json", ".live_chat.jsonl")
 
 # Resolve INPUT/OUTPUT relative to the script so it works from any working directory
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -38,11 +44,21 @@ OUTPUT_DIR = SCRIPT_DIR / "OUTPUT"
 
 DEFAULT_WHISPER_MODEL = "large-v3"
 DEFAULT_OLLAMA_MODEL = "qwen2.5:14b"
-TRANSLATION_BATCH_SIZE = 20  # subtitle blocks per LLM call
-LOOKBACK_COUNT = 5           # preceding translated lines for context continuity
-LOOKAHEAD_COUNT = 3          # upcoming untranslated lines for sentence flow
-MIN_CUE_DURATION_MS = 100    # drop micro-duration artifact cues (e.g. YouTube autogen flashes)
-OLLAMA_RETRIES = 2           # extra attempts when an Ollama request fails (timeouts, reloads)
+TRANSLATION_BATCH_SIZE = 20       # subtitle blocks per LLM call
+CHAT_TRANSLATION_BATCH_SIZE = 35  # live chat messages per LLM call
+LOOKBACK_COUNT = 5                # preceding translated lines for context continuity
+LOOKAHEAD_COUNT = 3               # upcoming untranslated lines for sentence flow
+CHAT_LOOKBACK_COUNT = 8           # preceding chat messages for thread continuity
+CHAT_LOOKAHEAD_COUNT = 4          # upcoming chat messages for reaction context
+MIN_CUE_DURATION_MS = 100         # drop micro-duration artifact cues (e.g. YouTube autogen flashes)
+OLLAMA_RETRIES = 2                # extra attempts when an Ollama request fails (timeouts, reloads)
+THINK_MODES = ("auto", "off", "on", "low", "medium", "high")
+
+# ASS sidebar chat overlay layout (1920x1080 virtual canvas)
+CHAT_DISPLAY_MS = 12_000          # how long each chat message stays visible before expiring
+CHAT_MAX_VISIBLE_MESSAGES = 10    # max simultaneous messages in the rolling sidebar window
+CHAT_MAX_VISIBLE_LINES = 14       # max wrapped visual lines in the rolling sidebar window
+CHAT_WRAP_COLUMNS = 40            # max visual character columns per sidebar line
 
 # Text-based subtitle codecs that can be converted/parsed (image subs like PGS/DVB cannot)
 TEXT_SUB_CODECS = {"srt", "subrip", "ass", "ssa", "webvtt", "mov_text", "text"}
@@ -66,6 +82,26 @@ class SubtitleBlock:
     start_time: str  # SRT format: HH:MM:SS,mmm
     end_time: str    # SRT format: HH:MM:SS,mmm
     text: str
+    translated_text: str = ""
+
+
+@dataclass
+class LiveChatMessage:
+    """A single chat message extracted from a YouTube live_chat.json replay log."""
+    index: int
+    line_no: int                # 1-based JSONL line number in the source file
+    slot_id: str                # deterministic action/renderer path within that JSONL line
+    offset_ms: int              # negative for pre-stream waiting room messages
+    timestamp_text: str         # e.g. "-0:40", "0:21", "1:02:15"
+    author: str                 # e.g. "@Cry4s722-みず"
+    role: str                   # "owner" | "moderator" | "member" | "viewer"
+    kind: str                   # "text" | "paid" | "sticker" | "membership"
+    amount_text: str = ""       # e.g. "¥1,000" for Super Chats / Stickers
+    header_text: str = ""       # membership header text if any
+    text: str = ""              # flattened message text (with Unicode emojis & :custom-emote: tokens)
+    custom_emojis: dict[str, dict] = field(default_factory=dict)
+    in_overlay: bool = True     # False for duplicate ticker popup items
+    needs_translation: bool = False
     translated_text: str = ""
 
 
@@ -288,9 +324,9 @@ def _language_code_to_name(code: str | None) -> str | None:
     return None
 
 
-def _detect_language_from_blocks(blocks: list[SubtitleBlock]) -> str | None:
+def _detect_language_from_texts(texts: list[str]) -> str | None:
     """Detect CJK languages from script usage. Distinguishes Chinese from Japanese by kana."""
-    text = "".join(b.text for b in blocks)
+    text = "".join(texts)
     kana = len(_KANA_RE.findall(text))
     hangul = len(_HANGUL_RE.findall(text))
     han = len(_HAN_RE.findall(text))
@@ -301,6 +337,11 @@ def _detect_language_from_blocks(blocks: list[SubtitleBlock]) -> str | None:
     if han >= 3:
         return "Chinese"
     return None
+
+
+def _detect_language_from_blocks(blocks: list[SubtitleBlock]) -> str | None:
+    """Detect CJK languages from subtitle blocks."""
+    return _detect_language_from_texts([b.text for b in blocks])
 
 
 def _resolve_source_lang(code: str | None, blocks: list[SubtitleBlock], override: str | None = None) -> str:
@@ -511,9 +552,21 @@ def _collapse_repetitions(text: str) -> str:
 
 # ── Translation ─────────────────────────────────────────────────────────────
 
+def _chat_base_stem(path: Path) -> str:
+    """Strip .live_chat.json / .live_chat.jsonl / .chat.json suffixes to recover the VOD base stem."""
+    name = path.name
+    lower = name.lower()
+    for suffix in (*LIVE_CHAT_SUFFIXES, ".chat.json", ".chat.jsonl"):
+        if lower.endswith(suffix):
+            return name[:-len(suffix)]
+    return path.stem
+
+
 def _clean_title_for_context(path: Path) -> str:
-    """Clean a media/subtitle filename to extract a human-readable show/episode title."""
-    name = path.stem
+    """Clean a media/subtitle/chat filename to extract a human-readable show or stream title."""
+    name = _chat_base_stem(path)
+    # Remove trailing .live_chat / .chat if still present
+    name = re.sub(r"\.(live_chat|chat)$", "", name, flags=re.IGNORECASE)
     # Remove language suffixes like .ja, .en, .jpn
     name = re.sub(r"\.(ja|jpn|en|eng|ko|kor|zh|chi)$", "", name, flags=re.IGNORECASE)
     # Remove resolution and quality tags
@@ -537,12 +590,14 @@ def _load_user_context(source_path: Path | None) -> str:
     A per-file context (`<name>.context.txt` next to the source) is combined with the first
     global context/glossary file found in INPUT/ or the project root.
     """
-    sections = []
+    sections: list[Path] = []
 
     if source_path:
-        per_file = source_path.parent / f"{source_path.stem}.context.txt"
-        if per_file.is_file():
-            sections.append(per_file)
+        base_stem = _chat_base_stem(source_path)
+        for stem_candidate in dict.fromkeys((base_stem, source_path.stem)):
+            per_file = source_path.parent / f"{stem_candidate}.context.txt"
+            if per_file.is_file() and per_file not in sections:
+                sections.append(per_file)
 
     global_candidates = [
         INPUT_DIR / "context.txt",
@@ -553,7 +608,7 @@ def _load_user_context(source_path: Path | None) -> str:
         SCRIPT_DIR / "glossary.json",
     ]
     for c in global_candidates:
-        if c.is_file():
+        if c.is_file() and c not in sections:
             sections.append(c)
             break
 
@@ -570,17 +625,96 @@ def _load_user_context(source_path: Path | None) -> str:
 
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_UNSUPPORTED_MODELS: set[str] = set()
 
 
-def _ollama_chat(model: str, messages: list[dict], options: dict, retries: int = OLLAMA_RETRIES) -> str:
-    """Call Ollama chat with retry/backoff. Strips <think> blocks from reasoning models."""
+def _resolve_think_param(think: str) -> bool | str | None:
+    """Convert CLI --think mode into the parameter expected by ollama.chat()."""
+    mode = (think or "auto").strip().lower()
+    if mode == "auto":
+        return None
+    if mode == "off":
+        return False
+    if mode == "on":
+        return True
+    if mode in ("low", "medium", "high"):
+        return mode
+    return None
+
+
+def _predict_budget(base_tokens: int, think: str, floor_thinking: int = 4096) -> int:
+    """Ensure num_predict has enough room for reasoning tokens when thinking is not disabled."""
+    if (think or "auto").strip().lower() == "off":
+        return base_tokens
+    return max(base_tokens * 2, floor_thinking)
+
+
+def _ollama_chat(
+    model: str,
+    messages: list[dict],
+    options: dict,
+    retries: int = OLLAMA_RETRIES,
+    think: str = "auto",
+) -> str:
+    """Call Ollama chat with retry/backoff and reasoning-model safeguards.
+
+    - Strips inline <think>...</think> blocks from reasoning models.
+    - Gracefully drops the `think` parameter if a non-thinking model rejects it.
+    - Automatically retries once with `think=False` if a reasoning model exhausts `num_predict`
+      inside its thinking trace and emits an empty answer.
+    """
     import ollama
+    think_param = None if model in _THINK_UNSUPPORTED_MODELS else _resolve_think_param(think)
     last_error: Exception | None = None
+
     for attempt in range(retries + 1):
         try:
-            response = ollama.chat(model=model, messages=messages, options=options)
-            content = response["message"]["content"] or ""
-            return _THINK_RE.sub("", content).strip()
+            kwargs: dict = {"model": model, "messages": messages, "options": options}
+            if think_param is not None:
+                kwargs["think"] = think_param
+            try:
+                response = ollama.chat(**kwargs)
+            except (TypeError, ollama.ResponseError) as e:
+                # Older ollama client without `think` kwarg, or a model that rejects `think`
+                err_msg = str(e).lower()
+                if think_param is not None and (
+                    isinstance(e, TypeError)
+                    or (getattr(e, "status_code", None) == 400 and "think" in err_msg)
+                ):
+                    _THINK_UNSUPPORTED_MODELS.add(model)
+                    think_param = None
+                    response = ollama.chat(model=model, messages=messages, options=options)
+                else:
+                    raise
+
+            msg_obj = response["message"]
+            raw_content = msg_obj["content"] or ""
+            cleaned = _THINK_RE.sub("", raw_content).strip()
+
+            done_reason = (
+                response.get("done_reason")
+                if isinstance(response, dict)
+                else getattr(response, "done_reason", None)
+            )
+            thinking_trace = (
+                msg_obj.get("thinking")
+                if isinstance(msg_obj, dict)
+                else getattr(msg_obj, "thinking", None)
+            ) or ("<think>" in raw_content.lower())
+
+            # Reasoning model spent its entire token budget thinking and produced no answer
+            if not cleaned and (done_reason == "length" or thinking_trace) and think_param is not False:
+                if model not in _THINK_UNSUPPORTED_MODELS:
+                    try:
+                        fallback_resp = ollama.chat(
+                            model=model, messages=messages, options=options, think=False
+                        )
+                        fallback_raw = fallback_resp["message"]["content"] or ""
+                        cleaned = _THINK_RE.sub("", fallback_raw).strip()
+                    except Exception:
+                        pass
+
+            return cleaned
         except ollama.ResponseError as e:
             # Model missing etc. — retrying won't help
             if getattr(e, "status_code", None) == 404:
@@ -620,6 +754,7 @@ def analyze_context(
     blocks: list[SubtitleBlock],
     source_path: Path | None = None,
     model: str = DEFAULT_OLLAMA_MODEL,
+    think: str = "auto",
 ) -> str:
     """Pass 1: Deep show, character, and terminology analysis across the entire episode."""
     user_context = _load_user_context(source_path)
@@ -665,7 +800,13 @@ Be concise, concrete, and directly actionable for subtitle translation (max 250 
         context = _ollama_chat(
             model,
             [{"role": "user", "content": prompt}],
-            {"temperature": 0.2, "num_ctx": 8192, "num_predict": 800, "repeat_penalty": 1.1},
+            {
+                "temperature": 0.2,
+                "num_ctx": 8192,
+                "num_predict": _predict_budget(800, think, floor_thinking=3072),
+                "repeat_penalty": 1.1,
+            },
+            think=think,
         )
         print("  ✓ Deep context & glossary analysis complete")
         if user_context:
@@ -695,6 +836,7 @@ def translate_blocks(
     model: str = DEFAULT_OLLAMA_MODEL,
     source_lang: str = "Japanese",
     batch_size: int = TRANSLATION_BATCH_SIZE,
+    think: str = "auto",
 ) -> list[SubtitleBlock]:
     """Pass 2: Translate subtitle blocks in bidirectional context-aware batches with automatic verification and retry."""
     if not blocks:
@@ -798,9 +940,10 @@ Translation Rules:
                 {
                     "temperature": 0.2,
                     "num_ctx": 8192,
-                    "num_predict": max(len(batch) * 80, 1000),
+                    "num_predict": _predict_budget(max(len(batch) * 80, 1000), think, floor_thinking=4096),
                     "repeat_penalty": 1.05,  # high values push the model away from repeating names/terms
                 },
+                think=think,
             )
             translated_dict = _parse_translation_response(response_text, len(batch))
             for i, block in enumerate(batch, 1):
@@ -832,9 +975,10 @@ Translation Rules:
                     {
                         "temperature": 0.1,
                         "num_ctx": 8192,
-                        "num_predict": max(len(retry_lines) * 80, 500),
+                        "num_predict": _predict_budget(max(len(retry_lines) * 80, 500), think, floor_thinking=3072),
                         "repeat_penalty": 1.05,
                     },
+                    think=think,
                 )
                 retry_dict = _parse_translation_response(retry_text, len(batch), allow_positional=False)
                 for idx in missing_indices:
@@ -865,7 +1009,13 @@ Translation Rules:
                             {"role": "system", "content": f"Translate this {source_lang} dialogue line into natural fluent English. Output ONLY the English translation of the requested line with no quotes, notes, or commentary.{context_section}"},
                             {"role": "user", "content": single_user},
                         ],
-                        {"temperature": 0.1, "num_ctx": 4096, "num_predict": 150, "repeat_penalty": 1.05},
+                        {
+                            "temperature": 0.1,
+                            "num_ctx": 8192,
+                            "num_predict": _predict_budget(200, think, floor_thinking=2048),
+                            "repeat_penalty": 1.05,
+                        },
+                        think=think,
                     )
                     single_text = _clean_translation_line(single_text.split("\n")[0])
                     if not _needs_retry(blk.text, single_text):
@@ -996,6 +1146,1005 @@ def write_srt(blocks: list[SubtitleBlock], output_path: Path, use_translated: bo
     print(f"  ✓ Written {written_count} subtitles to {output_path}")
 
 
+# ── YouTube VOD Live Chat (*.live_chat.json) ────────────────────────────────
+
+_CHAT_RENDERER_KINDS = {
+    "liveChatTextMessageRenderer": "text",
+    "liveChatPaidMessageRenderer": "paid",
+    "liveChatPaidStickerRenderer": "sticker",
+    "liveChatMembershipItemRenderer": "membership",
+}
+
+# YouTube auto-appends collision suffixes like "-l6o1s" or "-e6j" to @handles
+_YT_HANDLE_SUFFIX_RE = re.compile(r"-[a-z]\d[a-z0-9]{1,3}$")
+_JP_LAUGH_ONLY_RE = re.compile(r"^[wW]{2,}$")
+
+# Pleasant high-contrast pastel colors in ASS BGR hex (&HBBGGRR&) for viewer handles
+_ASS_AUTHOR_PALETTE = (
+    "EADE80",  # soft cyan
+    "B18FF4",  # soft pink
+    "A5E1C5",  # soft lime
+    "D893CE",  # soft lavender
+    "91ABFF",  # soft peach
+    "F9CA90",  # soft sky
+    "9DF5FF",  # soft yellow
+    "C4CB80",  # soft mint
+)
+_ASS_ROLE_COLORS = {
+    "owner": "4FD5FF",      # warm gold (#FFD54F)
+    "moderator": "FF9E5E",  # YouTube mod blue (#5E9EFF)
+    "member": "68E34B",     # YouTube member green (#4BE368)
+}
+_ASS_SUPERCHAT_COLOR = "4370FF"  # bright coral/orange (#FF7043)
+
+
+def is_live_chat_file(path: Path) -> bool:
+    """Return True if path is a yt-dlp YouTube live_chat.json / JSONL replay file."""
+    if not path.is_file():
+        return False
+    lower = path.name.lower()
+    if lower in ("glossary.json",):
+        return False
+    if lower.endswith(LIVE_CHAT_SUFFIXES):
+        return True
+    if path.suffix.lower() in (".json", ".jsonl"):
+        try:
+            with open(path, "rb") as f:
+                head = f.read(65536).decode("utf-8-sig", errors="ignore")
+            for line in head.splitlines():
+                line = line.strip()
+                if line:
+                    return line.startswith("{") and '"replayChatItemAction"' in line
+        except OSError:
+            return False
+    return False
+
+
+def _parse_chat_offset_ms(video_offset_msec: str | int | None, timestamp_text: str) -> int:
+    """Compute signed millisecond offset relative to stream start (0:00).
+
+    YouTube sets videoOffsetTimeMsec="0" on all pre-stream waiting-room messages while storing
+    their negative offset in timestampText (e.g. "-20:42"). Parsing the negative timestamp keeps
+    waiting-room messages from piling up at 00:00:00 in video overlays.
+    """
+    raw_ms = 0
+    if video_offset_msec is not None:
+        try:
+            raw_ms = int(video_offset_msec)
+        except (TypeError, ValueError):
+            raw_ms = 0
+
+    ts = (timestamp_text or "").strip()
+    if ts:
+        neg = ts.startswith("-")
+        clean_ts = ts.lstrip("+-").strip()
+        parts = clean_ts.split(":")
+        if len(parts) in (2, 3) and all(p.isdigit() for p in parts):
+            nums = [int(p) for p in parts]
+            secs = (nums[0] * 3600 + nums[1] * 60 + nums[2]) if len(nums) == 3 else (nums[0] * 60 + nums[1])
+            parsed_ms = secs * 1000
+            if neg and raw_ms <= 0:
+                return -parsed_ms
+            if not neg and raw_ms == 0 and parsed_ms > 0:
+                return parsed_ms
+
+    return raw_ms
+
+
+def _extract_author_role(renderer: dict) -> str:
+    """Identify the chatter's highest badge role: owner > moderator > member > viewer."""
+    role = "viewer"
+    for badge in renderer.get("authorBadges") or []:
+        b = badge.get("liveChatAuthorBadgeRenderer") or {}
+        icon_type = ((b.get("icon") or {}).get("iconType") or "").upper()
+        label = (
+            b.get("tooltip")
+            or ((b.get("accessibility") or {}).get("accessibilityData") or {}).get("label")
+            or ""
+        ).lower()
+        if icon_type == "OWNER" or "owner" in label:
+            return "owner"
+        if icon_type == "MODERATOR" or "moderator" in label:
+            role = "moderator"
+        elif role == "viewer" and ("member" in label or "customThumbnail" in b):
+            role = "member"
+    return role
+
+
+def _extract_runs_text(runs: list[dict]) -> tuple[str, dict[str, dict]]:
+    """Flatten YouTube message runs into text plus a map of :custom-emote: tokens to run dicts."""
+    parts: list[str] = []
+    custom_emojis: dict[str, dict] = {}
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        if "text" in run:
+            parts.append(str(run["text"]))
+        elif "emoji" in run and isinstance(run["emoji"], dict):
+            em = run["emoji"]
+            if em.get("isCustomEmoji"):
+                shortcuts = em.get("shortcuts") or []
+                label = (
+                    ((em.get("image") or {}).get("accessibility") or {})
+                    .get("accessibilityData") or {}
+                ).get("label", "")
+                raw_token = shortcuts[0] if shortcuts else (f":{label}:" if label else ":emote:")
+                clean_inner = re.sub(r"\s+", "-", raw_token.strip(":")) or "emote"
+                token = f":{clean_inner}:"
+                if parts and not parts[-1].endswith(" "):
+                    parts.append(" ")
+                parts.append(token)
+                parts.append(" ")
+                custom_emojis[token] = run
+            else:
+                emoji_str = (
+                    em.get("emojiId")
+                    or (
+                        ((em.get("image") or {}).get("accessibility") or {})
+                        .get("accessibilityData") or {}
+                    ).get("label", "")
+                )
+                parts.append(str(emoji_str))
+    text = re.sub(r" +", " ", "".join(parts)).strip()
+    return text, custom_emojis
+
+
+def _rebuild_chat_runs(translated_text: str, custom_emojis: dict[str, dict]) -> list[dict]:
+    """Reconstruct YouTube message.runs from translated text, preserving custom emoji run objects."""
+    if not custom_emojis:
+        return [{"text": translated_text}]
+
+    # Split around known custom emoji tokens (longest token first to avoid prefix collisions)
+    tokens_sorted = sorted(custom_emojis.keys(), key=len, reverse=True)
+    pattern = re.compile("(" + "|".join(re.escape(t) for t in tokens_sorted) + ")")
+    runs: list[dict] = []
+    for piece in pattern.split(translated_text):
+        if not piece:
+            continue
+        if piece in custom_emojis:
+            runs.append(copy.deepcopy(custom_emojis[piece]))
+        else:
+            runs.append({"text": piece})
+    return runs or [{"text": translated_text}]
+
+
+def _iter_chat_renderers(record: dict):
+    """Yield (slot_id, kind, renderer_dict, in_overlay) for chat items inside a JSONL record."""
+    rcia = record.get("replayChatItemAction")
+    if not isinstance(rcia, dict):
+        return
+    for act_idx, act in enumerate(rcia.get("actions") or []):
+        if not isinstance(act, dict):
+            continue
+        if "addChatItemAction" in act:
+            item = (act["addChatItemAction"] or {}).get("item") or {}
+            for r_key, kind in _CHAT_RENDERER_KINDS.items():
+                if r_key in item and isinstance(item[r_key], dict):
+                    yield f"{act_idx}:add:{r_key}", kind, item[r_key], True
+        if "replaceChatItemAction" in act:
+            item = (act["replaceChatItemAction"] or {}).get("replacementItem") or {}
+            for r_key, kind in _CHAT_RENDERER_KINDS.items():
+                if r_key in item and isinstance(item[r_key], dict):
+                    yield f"{act_idx}:rep:{r_key}", kind, item[r_key], False
+        if "addLiveChatTickerItemAction" in act:
+            t_item = (act["addLiveChatTickerItemAction"] or {}).get("item") or {}
+            for t_key, t_val in t_item.items():
+                if not isinstance(t_val, dict):
+                    continue
+                inner = (
+                    ((t_val.get("showItemEndpoint") or {}).get("showLiveChatItemEndpoint") or {})
+                    .get("renderer") or {}
+                )
+                for r_key, kind in _CHAT_RENDERER_KINDS.items():
+                    if r_key in inner and isinstance(inner[r_key], dict):
+                        yield f"{act_idx}:ticker:{t_key}:{r_key}", kind, inner[r_key], False
+
+
+def _simple_or_runs_text(field_obj: dict | None) -> str:
+    """Extract plain text from a YouTube {simpleText: ...} or {runs: [...]} field."""
+    if not isinstance(field_obj, dict):
+        return ""
+    if "simpleText" in field_obj:
+        return str(field_obj["simpleText"]).strip()
+    if "runs" in field_obj and isinstance(field_obj["runs"], list):
+        txt, _ = _extract_runs_text(field_obj["runs"])
+        return txt
+    return ""
+
+
+def _chat_message_needs_translation(
+    text: str,
+    custom_emojis: dict[str, dict],
+    source_lang: str,
+) -> bool:
+    """Return True if a chat message contains foreign-language words that need LLM translation.
+
+    Automatically skips emoji-only, custom-emote-only, numeric/punctuation-only, and (for CJK
+    streams) already-English/ASCII messages — including stylized Unicode Latin like '𝑶𝑯 𝑴𝒀 𝑮𝑶𝑫'.
+    """
+    stripped = text
+    for token in custom_emojis:
+        stripped = stripped.replace(token, " ")
+    norm = unicodedata.normalize("NFKC", stripped).strip()
+    if not norm:
+        return False
+
+    # Pure emojis, numbers, kaomoji, or punctuation — no letters in any script
+    if not any(ch.isalpha() for ch in norm):
+        return False
+
+    if source_lang in ("Japanese", "Korean", "Chinese"):
+        # Standalone Japanese "www" / "ｗｗｗｗ" laughter should still translate to "lol"
+        if source_lang == "Japanese" and _JP_LAUGH_ONLY_RE.match(norm):
+            return True
+        # Every letter in the normalized message is basic Latin (English viewer chat)
+        if all(ord(ch) < 128 for ch in norm if ch.isalpha()):
+            return False
+
+    return True
+
+
+def parse_yt_live_chat(path: Path, language_override: str | None = None) -> tuple[list[LiveChatMessage], str]:
+    """Stream-parse a yt-dlp *.live_chat.json file into LiveChatMessage entries and resolve language."""
+    messages: list[LiveChatMessage] = []
+    malformed = 0
+
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+        for line_no, raw_line in enumerate(f, 1):
+            raw_str = raw_line.strip()
+            if not raw_str:
+                continue
+            try:
+                record = json.loads(raw_str)
+            except json.JSONDecodeError:
+                malformed += 1
+                continue
+            if not isinstance(record, dict):
+                continue
+
+            rcia = record.get("replayChatItemAction") or {}
+            video_offset_raw = rcia.get("videoOffsetTimeMsec")
+
+            for slot_id, kind, renderer, in_overlay in _iter_chat_renderers(record):
+                author = _simple_or_runs_text(renderer.get("authorName")) or "Chat"
+                ts_text = _simple_or_runs_text(renderer.get("timestampText"))
+                offset_ms = _parse_chat_offset_ms(video_offset_raw, ts_text)
+                role = _extract_author_role(renderer)
+                amount_text = _simple_or_runs_text(renderer.get("purchaseAmountText"))
+                header_text = (
+                    _simple_or_runs_text(renderer.get("headerPrimaryText"))
+                    or _simple_or_runs_text(renderer.get("headerSubtext"))
+                )
+
+                msg_obj = renderer.get("message")
+                runs = msg_obj.get("runs") if isinstance(msg_obj, dict) else None
+                text, custom_emojis = _extract_runs_text(runs) if isinstance(runs, list) else ("", {})
+
+                # Skip completely empty items (unless paid Super Chat/Sticker or Membership event)
+                if not text and not amount_text and not header_text:
+                    continue
+
+                messages.append(LiveChatMessage(
+                    index=len(messages) + 1,
+                    line_no=line_no,
+                    slot_id=slot_id,
+                    offset_ms=offset_ms,
+                    timestamp_text=ts_text,
+                    author=author,
+                    role=role,
+                    kind=kind,
+                    amount_text=amount_text,
+                    header_text=header_text,
+                    text=text,
+                    custom_emojis=custom_emojis,
+                    in_overlay=in_overlay,
+                ))
+
+    if malformed:
+        print(f"  ⚠ Skipped {malformed} malformed JSON line(s) in {path.name}")
+
+    # Resolve primary stream chat language
+    if language_override:
+        source_lang = _language_code_to_name(language_override) or language_override
+    else:
+        detected = _detect_language_from_texts([m.text for m in messages if m.text])
+        source_lang = detected or _UNKNOWN_LANG
+
+    for m in messages:
+        if m.text and m.kind in ("text", "paid", "membership"):
+            m.needs_translation = _chat_message_needs_translation(m.text, m.custom_emojis, source_lang)
+        else:
+            m.needs_translation = False
+
+    return messages, source_lang
+
+
+def _clean_chat_author(author: str) -> str:
+    """Clean a YouTube handle for compact display (strips leading @ and random -x9y collision tags)."""
+    clean = (author or "").strip()
+    if clean.startswith("@") and len(clean) > 1:
+        clean = clean[1:]
+    clean = _YT_HANDLE_SUFFIX_RE.sub("", clean)
+    return clean or (author or "Chat").strip()
+
+
+def _clean_chat_translation(text: str, author: str, custom_emojis: dict[str, dict]) -> str:
+    """Strip LLM formatting/echoed sender handles and restore any dropped custom emote tokens."""
+    cleaned = _clean_translation_line(text)
+    if not cleaned:
+        return ""
+
+    # Strip echoed sender handle at the start of the message (e.g. "(@user) msg" or "@user: msg")
+    raw_author = (author or "").strip()
+    short_author = _clean_chat_author(raw_author)
+    for handle in dict.fromkeys(h for h in (raw_author, raw_author.lstrip("@"), short_author) if h):
+        esc = re.escape(handle)
+        cleaned = re.sub(
+            rf"^(?:\(\s*@?{esc}\s*\)\s*:?\s*|@?{esc}\s*:\s+)",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+
+    # Never lose custom channel/YouTube emotes that appeared in the original message
+    for token in custom_emojis:
+        if token not in cleaned:
+            cleaned = f"{cleaned} {token}".strip()
+
+    return cleaned
+
+
+def analyze_chat_context(
+    messages: list[LiveChatMessage],
+    source_path: Path | None = None,
+    model: str = DEFAULT_OLLAMA_MODEL,
+    think: str = "auto",
+) -> str:
+    """Pass 1 (Live Chat): Identify streamers, collab topic, nicknames, and recurring chat slang."""
+    user_context = _load_user_context(source_path)
+
+    title_info = ""
+    if source_path:
+        cleaned_title = _clean_title_for_context(source_path)
+        title_info = f"Stream / VOD Title (from filename): {cleaned_title}\n"
+
+    candidates = [m for m in messages if m.in_overlay and m.needs_translation and m.text]
+    if not candidates:
+        return user_context
+
+    sample_size = min(len(candidates), 75)
+    if len(candidates) <= sample_size:
+        samples = candidates
+    else:
+        part = sample_size // 3
+        mid_start = (len(candidates) - part) // 2
+        samples = candidates[:part] + candidates[mid_start:mid_start + part] + candidates[-part:]
+
+    sample_text = "\n".join(f"({m.author}) {m.text}" for m in samples)
+    user_section = f"User-provided notes/glossary (authoritative — always prefer these):\n{user_context}\n" if user_context else ""
+
+    prompt = f"""You are a senior livestream and VTuber/utaite localization director.
+Analyze this YouTube stream's title and viewer live chat samples to write a concise translation briefing.
+
+{title_info}Live chat samples:
+{sample_text}
+
+{user_section}
+Respond with a concise context guide containing:
+1. Streamers & Collaborators: (Names, preferred English romanizations, fan nicknames, and honorific usage)
+2. Stream Premise & Moments: (What kind of stream this is — collab, karaoke, announcement, gaming, Q&A — and key topics viewers are reacting to)
+3. Recurring Chat Terms & Inside Jokes: (Consistent English translations for recurring names, slang, abbreviations, or jokes in the chat)
+
+Only state facts supported by the stream title, chat samples, or user notes. Do not invent lore if unsure.
+Keep it concrete and directly actionable for translating viewer chat messages (max 220 words)."""
+
+    try:
+        context = _ollama_chat(
+            model,
+            [{"role": "user", "content": prompt}],
+            {
+                "temperature": 0.2,
+                "num_ctx": 8192,
+                "num_predict": _predict_budget(750, think, floor_thinking=3072),
+                "repeat_penalty": 1.1,
+            },
+            think=think,
+        )
+        print("  ✓ Stream chat context & glossary analysis complete")
+        if user_context:
+            context = f"### User Notes & Glossary (authoritative):\n{user_context}\n\n" + context
+        return context
+    except Exception as e:
+        print(f"  ⚠ Chat context analysis failed: {e}")
+        return user_context
+
+
+def translate_chat_messages(
+    messages: list[LiveChatMessage],
+    context: str = "",
+    model: str = DEFAULT_OLLAMA_MODEL,
+    source_lang: str = "Japanese",
+    batch_size: int = CHAT_TRANSLATION_BATCH_SIZE,
+    think: str = "auto",
+) -> list[LiveChatMessage]:
+    """Pass 2 (Live Chat): Translate YouTube VOD chat messages with slang localization and caching."""
+    for m in messages:
+        if not m.needs_translation:
+            m.translated_text = m.text
+
+    translatable = [m for m in messages if m.needs_translation]
+    if not translatable:
+        print("  → All chat messages are already in English or emoji-only, skipping translation")
+        return messages
+
+    batch_size = max(1, batch_size)
+    print(
+        f"  → Translating {len(translatable)} chat message(s) from {source_lang} "
+        f"({len(messages) - len(translatable)} emoji/English message(s) kept as-is)..."
+    )
+
+    context_section = ""
+    if context:
+        context_section = f"\n\n### Stream Context & Glossary (follow strictly):\n{context}\n### End Context"
+
+    jp_slang_guide = (
+        "- Localize Japanese livestream & VTuber/utaite chat slang naturally into idiomatic English stream chat:\n"
+        "  • trailing w / ww / 草 / 大草原 → \"lol\" / \"lmao\" (never translate 草 literally as \"grass\" or leave raw \"w\" attached to English words)\n"
+        "  • trailing （ or （） → playful self-aware aside, e.g. \"(lol)\" or light deadpan tone\n"
+        "  • 待機 → \"Waiting!\" / \"Standing by!\", きた / キター → \"Here we go!\" / \"It's here!\"\n"
+        "  • てぇてぇ / 尊い / 尊死 → \"so precious\" / \"so wholesome\" / \"dying from how precious this is\"\n"
+        "  • 推し → \"oshi\" or \"fave\", 切り抜き → \"clips\", ﾀﾋ → \"die\" (slang)\n"
+        "  • ナイスパ / ないすぱ → \"Nice Super Chat!\", 赤スパ → \"Red Super Chat\"\n"
+        "  • おつ / お疲れ様でした → \"Thanks for the stream!\" / \"Good work!\", 8888 → applause/clapping\n"
+        "- Keep Japanese honorifics (-san, -chan, -kun, -senpai, -sama) on streamer/viewer names unless the glossary specifies otherwise.\n"
+        if source_lang == "Japanese" else ""
+    )
+
+    system_prompt = f"""You are an expert livestream and VTuber/utaite chat translator. Translate {source_lang} (and any occasional mixed non-English) YouTube live chat messages into natural, lively, idiomatic English livestream chat.
+
+Translation Rules:
+- Output EXACTLY one translation per numbered input line, keeping each line's [N] number prefix.
+- Input lines include the sender handle in parentheses like `[1] (@user) message` ONLY so you can tell who is talking or replying to whom. Do NOT output `(@user)` — output ONLY `[1] Translated message`.
+- Never merge or split messages: output [N] must correspond to input [N].
+- Match the casual energy, excitement, humor, and punctuation (!, ?, ~) of real livestream chatters.
+{jp_slang_guide}- Preserve all Unicode emojis (🥳, 😭, 👏, 🫶🏻) and colon-wrapped custom emote codes (e.g. `:face-blue-smiling:`) intact.
+- If an individual message is written in another non-English language (e.g. Korean `안녕하세요~` inside a Japanese chat), translate it to English as well.
+- Output English only — never leave untranslated CJK characters in the output.
+- Do NOT add translator notes, explanations, or commentary.
+- Example:
+Input:
+[1] (@userA) 待機！
+[2] (@userB) 赤スパで殴られてるw :face-blue-smiling:
+Output:
+[1] Standing by!
+[2] Getting pelted with Red Super Chats lol :face-blue-smiling:{context_section}"""
+
+    # Exact-match cache avoids re-translating repeated greetings/reactions across long VODs
+    cache: dict[str, str] = {}
+    cache_hits = 0
+    unresolved = 0
+    processed_count = 0
+    cursor = 0
+    batch_num = 0
+
+    # Map LiveChatMessage.index (1-based) to 0-based position in `messages`
+    while cursor < len(translatable):
+        batch: list[LiveChatMessage] = []
+        while cursor < len(translatable) and len(batch) < batch_size:
+            msg = translatable[cursor]
+            cursor += 1
+            cached = cache.get(msg.text)
+            if cached:
+                msg.translated_text = cached
+                cache_hits += 1
+                processed_count += 1
+            else:
+                batch.append(msg)
+
+        if not batch:
+            break
+
+        batch_num += 1
+        first_pos = batch[0].index - 1
+        last_pos = batch[-1].index - 1
+
+        # Chronological lookback (includes skipped English messages & cached reactions!)
+        lookback_lines = []
+        for prev in messages[max(0, first_pos - CHAT_LOOKBACK_COUNT):first_pos]:
+            if not prev.text:
+                continue
+            if prev.needs_translation and prev.translated_text:
+                lookback_lines.append(f"  • ({prev.author}) {prev.text}  →  {prev.translated_text}")
+            else:
+                lookback_lines.append(f"  • ({prev.author}) {prev.text}")
+
+        # Chronological lookahead
+        lookahead_lines = []
+        for nxt in messages[last_pos + 1:min(len(messages), last_pos + 1 + CHAT_LOOKAHEAD_COUNT)]:
+            if nxt.text:
+                lookahead_lines.append(f"  • ({nxt.author}) {nxt.text}")
+
+        lines_to_translate = [f"[{i}] ({m.author}) {m.text}" for i, m in enumerate(batch, 1)]
+        batch_text = "\n".join(lines_to_translate)
+
+        prompt_sections = []
+        if lookback_lines:
+            prompt_sections.append(
+                "### Preceding Chat History (context only — do NOT re-translate):\n"
+                + "\n".join(lookback_lines)
+            )
+        prompt_sections.append(
+            f"### Chat Messages to Translate ({len(batch)} messages):\n"
+            f"Output EXACTLY {len(batch)} lines numbered [1] to [{len(batch)}] (without sender handles):\n\n"
+            + batch_text
+        )
+        if lookahead_lines:
+            prompt_sections.append(
+                "### Upcoming Chat Preview (context only — do NOT translate):\n"
+                + "\n".join(lookahead_lines)
+            )
+        user_prompt = "\n\n".join(prompt_sections)
+
+        try:
+            response_text = _ollama_chat(
+                model,
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                {
+                    "temperature": 0.2,
+                    "num_ctx": 8192,
+                    "num_predict": _predict_budget(max(len(batch) * 65, 1000), think, floor_thinking=4096),
+                    "repeat_penalty": 1.05,
+                },
+                think=think,
+            )
+            translated_dict = _parse_translation_response(response_text, len(batch))
+            for i, m in enumerate(batch, 1):
+                cand = _clean_chat_translation(translated_dict.get(i, ""), m.author, m.custom_emojis)
+                m.translated_text = cand
+                if cand and not _needs_retry(m.text, cand):
+                    cache[m.text] = cand
+        except Exception as e:
+            print(f"  ⚠ Chat batch {batch_num} translation error: {e}")
+            for m in batch:
+                m.translated_text = ""
+
+        # Fill any duplicate lines inside the same batch that succeeded earlier in the batch
+        for m in batch:
+            if _needs_retry(m.text, m.translated_text) and m.text in cache:
+                m.translated_text = cache[m.text]
+
+        missing_indices = [i for i, m in enumerate(batch, 1) if _needs_retry(m.text, m.translated_text)]
+        if missing_indices:
+            print(f"  ⚠ {len(missing_indices)} chat line(s) missing/untranslated in batch {batch_num}, retrying...")
+            retry_lines = [f"[{idx}] ({batch[idx-1].author}) {batch[idx-1].text}" for idx in missing_indices]
+            retry_prompt = (
+                "### Surrounding chat batch for reference (do NOT output these):\n" + batch_text + "\n\n"
+                f"### Translate ONLY these {len(retry_lines)} chat message(s) into natural English.\n"
+                f"Output EXACTLY {len(retry_lines)} line(s), keeping each original [N] number (without sender handles):\n\n"
+                + "\n".join(retry_lines)
+            )
+            try:
+                retry_text = _ollama_chat(
+                    model,
+                    [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": retry_prompt},
+                    ],
+                    {
+                        "temperature": 0.1,
+                        "num_ctx": 8192,
+                        "num_predict": _predict_budget(max(len(retry_lines) * 70, 500), think, floor_thinking=3072),
+                        "repeat_penalty": 1.05,
+                    },
+                    think=think,
+                )
+                retry_dict = _parse_translation_response(retry_text, len(batch), allow_positional=False)
+                for idx in missing_indices:
+                    m = batch[idx - 1]
+                    cand = _clean_chat_translation(retry_dict.get(idx, ""), m.author, m.custom_emojis)
+                    if cand and not _needs_retry(m.text, cand):
+                        m.translated_text = cand
+                        cache[m.text] = cand
+            except Exception as e:
+                print(f"  ⚠ Chat batch retry error: {e}")
+
+            # Single-line fallback for any remaining stubborn message
+            for idx in missing_indices:
+                m = batch[idx - 1]
+                if not _needs_retry(m.text, m.translated_text):
+                    continue
+                if m.text in cache:
+                    m.translated_text = cache[m.text]
+                    continue
+                try:
+                    single_raw = _ollama_chat(
+                        model,
+                        [
+                            {
+                                "role": "system",
+                                "content": (
+                                    f"Translate this {source_lang} livestream chat message into natural casual English. "
+                                    f"Output ONLY the translated message text with no quotes, sender name, or notes.{context_section}"
+                                ),
+                            },
+                            {"role": "user", "content": m.text},
+                        ],
+                        {
+                            "temperature": 0.1,
+                            "num_ctx": 8192,
+                            "num_predict": _predict_budget(180, think, floor_thinking=2048),
+                            "repeat_penalty": 1.05,
+                        },
+                        think=think,
+                    )
+                    single_clean = _clean_chat_translation(single_raw.split("\n")[0], m.author, m.custom_emojis)
+                    if single_clean and not _needs_retry(m.text, single_clean):
+                        m.translated_text = single_clean
+                        cache[m.text] = single_clean
+                except Exception as e:
+                    print(f"  ⚠ Single-message fallback failed for chat #{m.index}: {e}")
+
+                if _needs_retry(m.text, m.translated_text):
+                    m.translated_text = m.text
+                    unresolved += 1
+
+        processed_count += len(batch)
+        pct = processed_count / len(translatable) * 100
+        cache_note = f", {cache_hits} cached" if cache_hits else ""
+        print(f"  → Progress: {pct:.0f}% ({processed_count}/{len(translatable)} messages{cache_note})")
+
+    if unresolved:
+        print(f"  ⚠ {unresolved} chat message(s) could not be translated and were kept in the original language")
+
+    return messages
+
+
+def write_translated_live_chat_json(
+    source_path: Path,
+    messages: list[LiveChatMessage],
+    output_path: Path,
+):
+    """Write a translated *.en.live_chat.json file preserving the full YouTube JSONL structure.
+
+    Lines without translated messages (system notices, emoji-only, already-English lines) are
+    copied verbatim; translated lines keep badges, avatars, Super Chat metadata, timestamps,
+    and custom emoji run objects intact.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    by_line: dict[int, dict[str, LiveChatMessage]] = {}
+    for m in messages:
+        if m.needs_translation and m.translated_text and m.translated_text != m.text:
+            by_line.setdefault(m.line_no, {})[m.slot_id] = m
+
+    updated_count = 0
+    total_lines = 0
+    with (
+        open(source_path, "r", encoding="utf-8-sig", errors="replace") as src,
+        open(output_path, "w", encoding="utf-8") as dst,
+    ):
+        for line_no, raw_line in enumerate(src, 1):
+            if not raw_line.strip():
+                continue
+            total_lines += 1
+            line_targets = by_line.get(line_no)
+            if not line_targets:
+                dst.write(raw_line if raw_line.endswith("\n") else raw_line + "\n")
+                continue
+
+            try:
+                record = json.loads(raw_line)
+            except json.JSONDecodeError:
+                dst.write(raw_line if raw_line.endswith("\n") else raw_line + "\n")
+                continue
+
+            modified = False
+            for slot_id, _, renderer, _ in _iter_chat_renderers(record):
+                msg = line_targets.get(slot_id)
+                if msg and isinstance(renderer.get("message"), dict):
+                    renderer["message"]["runs"] = _rebuild_chat_runs(
+                        msg.translated_text, msg.custom_emojis
+                    )
+                    modified = True
+                    updated_count += 1
+
+            if modified:
+                dst.write(json.dumps(record, ensure_ascii=False) + "\n")
+            else:
+                dst.write(raw_line if raw_line.endswith("\n") else raw_line + "\n")
+
+    print(f"  ✓ Written translated live chat JSONL ({updated_count} translated / {total_lines} lines) to {output_path}")
+
+
+def _cs_to_ass_time(total_cs: int) -> str:
+    """Convert integer centiseconds (1/100s) to ASS timestamp format (H:MM:SS.CC)."""
+    total_cs = max(0, int(total_cs))
+    total_secs, cs = divmod(total_cs, 100)
+    hours, rem = divmod(total_secs, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}.{cs:02d}"
+
+
+def _escape_ass_text(text: str) -> str:
+    """Escape ASS control characters so arbitrary chat usernames/messages never break tags."""
+    text = text.replace("\\", "＼").replace("{", "｛").replace("}", "｝")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _visual_char_width(ch: str) -> int:
+    """Approximate display column width (2 for CJK/fullwidth/emoji, 1 for narrow ASCII)."""
+    if ord(ch) >= 0x1F000 or unicodedata.east_asian_width(ch) in ("W", "F"):
+        return 2
+    return 1
+
+
+def _visual_str_width(s: str) -> int:
+    return sum(_visual_char_width(ch) for ch in s)
+
+
+def _wrap_plain_columns(text: str, first_limit: int, next_limit: int, max_lines: int = 3) -> list[str]:
+    """Wrap plain text by visual column width, preferring space boundaries and capping line count."""
+    if not text:
+        return [""]
+
+    lines: list[str] = []
+    cur: list[str] = []
+    cur_w = 0
+    limit = max(8, first_limit)
+
+    idx = 0
+    n = len(text)
+    while idx < n:
+        ch = text[idx]
+        w = _visual_char_width(ch)
+        if cur_w + w > limit and cur:
+            line_str = "".join(cur)
+            # Break cleanly at the last space if one exists in the second half of the line
+            space_pos = line_str.rfind(" ")
+            if space_pos >= len(line_str) // 2 and ch != " ":
+                lines.append(line_str[:space_pos].rstrip())
+                leftover = line_str[space_pos + 1:].lstrip()
+                cur = list(leftover)
+                cur_w = _visual_str_width(leftover)
+            else:
+                lines.append(line_str.rstrip())
+                cur = []
+                cur_w = 0
+            limit = max(8, next_limit)
+            if len(lines) == max_lines - 1:
+                # Last allowed line: fit what remains and ellipsize if needed
+                rem = ("".join(cur) + text[idx:]).strip()
+                if _visual_str_width(rem) <= limit:
+                    lines.append(rem)
+                else:
+                    trimmed: list[str] = []
+                    tw = 0
+                    for rch in rem:
+                        rw = _visual_char_width(rch)
+                        if tw + rw > limit - 2:
+                            break
+                        trimmed.append(rch)
+                        tw += rw
+                    lines.append("".join(trimmed).rstrip() + "…")
+                return lines
+            if ch == " " and not cur:
+                idx += 1
+                continue
+        cur.append(ch)
+        cur_w += w
+        idx += 1
+
+    if cur or not lines:
+        lines.append("".join(cur).rstrip())
+    return lines
+
+
+def _author_ass_color(author: str, role: str) -> str:
+    """Pick an ASS BGR hex color for a username based on badge role or deterministic hash."""
+    if role in _ASS_ROLE_COLORS:
+        return _ASS_ROLE_COLORS[role]
+    idx = zlib.crc32(author.encode("utf-8")) % len(_ASS_AUTHOR_PALETTE)
+    return _ASS_AUTHOR_PALETTE[idx]
+
+
+def _format_ass_chat_lines(msg: LiveChatMessage, max_cols: int = CHAT_WRAP_COLUMNS) -> list[str]:
+    """Format a LiveChatMessage into 1–3 ASS-styled lines for the sidebar chat overlay."""
+    short_author = _clean_chat_author(msg.author)
+    if _visual_str_width(short_author) > 16:
+        acc: list[str] = []
+        w = 0
+        for ch in short_author:
+            cw = _visual_char_width(ch)
+            if w + cw > 14:
+                break
+            acc.append(ch)
+            w += cw
+        short_author = "".join(acc) + "…"
+
+    color = _author_ass_color(msg.author, msg.role)
+    role_prefix = ""
+    if msg.role == "owner":
+        role_prefix = "[★] "
+    elif msg.role == "moderator":
+        role_prefix = "[Mod] "
+
+    pre_tag = f"({msg.timestamp_text}) " if (msg.offset_ms < 0 and msg.timestamp_text) else ""
+    body = (msg.translated_text if (msg.needs_translation and msg.translated_text) else msg.text).strip()
+
+    badge_plain = ""
+    badge_ass = ""
+    if msg.kind in ("paid", "sticker") and msg.amount_text:
+        label = "Sticker" if msg.kind == "sticker" else "SC"
+        badge_plain = f"[{label} {msg.amount_text}] "
+        badge_ass = f"{{\\c&H{_ASS_SUPERCHAT_COLOR}&\\b1}}{_escape_ass_text(badge_plain)}{{\\b0\\c&HF2F2F2&}}"
+    elif msg.kind == "membership":
+        mem_label = msg.header_text or "New Member"
+        badge_plain = f"[{mem_label}] "
+        badge_ass = f"{{\\c&H{_ASS_ROLE_COLORS['member']}&\\b1}}{_escape_ass_text(badge_plain)}{{\\b0\\c&HF2F2F2&}}"
+
+    header_plain = f"{pre_tag}{role_prefix}{short_author}: "
+    first_avail = max(12, max_cols - _visual_str_width(header_plain) - _visual_str_width(badge_plain))
+
+    wrapped = _wrap_plain_columns(body, first_limit=first_avail, next_limit=max_cols - 2, max_lines=3)
+
+    pre_ass = f"{{\\c&HA8A8A8&}}{_escape_ass_text(pre_tag)}" if pre_tag else ""
+    author_ass = f"{{\\c&H{color}&\\b1}}{_escape_ass_text(role_prefix + short_author)}:{{\\b0\\c&HF2F2F2&}} "
+
+    first_body = _escape_ass_text(wrapped[0]) if wrapped[0] else ""
+    out_lines = [f"{pre_ass}{author_ass}{badge_ass}{first_body}".rstrip()]
+    for cont in wrapped[1:]:
+        out_lines.append("  " + _escape_ass_text(cont))
+    return out_lines
+
+
+def write_chat_ass(
+    messages: list[LiveChatMessage],
+    output_path: Path,
+    dialogue_blocks: list[SubtitleBlock] | None = None,
+):
+    """Write a styled 1920x1080 ASS subtitle track rendering a scrolling YouTube chat sidebar.
+
+    Uses centisecond-aligned, coalesced time-slice snapshots so rapid chat bursts scroll smoothly
+    in strict chronological order without colliding with bottom-center spoken dialogue subtitles.
+    When `dialogue_blocks` is also provided, both bottom spoken dialogue and top-right live chat
+    are combined into a single self-contained `.ass` file that works in any video player.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    overlay_msgs = [
+        m for m in messages
+        if m.in_overlay and (m.text or m.amount_text or m.header_text)
+    ]
+    pre_msgs = [m for m in overlay_msgs if -120_000 <= m.offset_ms < 0][-6:]
+    live_msgs = sorted(
+        (m for m in overlay_msgs if m.offset_ms >= 0),
+        key=lambda m: (m.offset_ms, m.index),
+    )
+
+    # Build (start_cs, end_cs, order_key, formatted_lines) items quantized to 10ms centiseconds
+    timed_items: list[tuple[int, int, int, list[str]]] = []
+    display_cs = max(100, round(CHAT_DISPLAY_MS / 10))
+
+    for m in pre_msgs:
+        timed_items.append((0, min(1000, display_cs), m.index, _format_ass_chat_lines(m)))
+
+    for m in live_msgs:
+        start_cs = max(0, round(m.offset_ms / 10))
+        end_cs = start_cs + display_cs
+        timed_items.append((start_cs, end_cs, m.index, _format_ass_chat_lines(m)))
+
+    # Sweep-line across all arrival/expiration timestamps to build exact rolling window snapshots
+    boundaries = sorted({cs for s, e, _, _ in timed_items for cs in (s, e)})
+    starts_at: dict[int, list[tuple[int, int, list[str]]]] = {}
+    ends_at: dict[int, set[int]] = {}
+    for s, e, order_key, fmt_lines in timed_items:
+        starts_at.setdefault(s, []).append((order_key, e, fmt_lines))
+        ends_at.setdefault(e, set()).add(order_key)
+
+    active: list[tuple[int, int, list[str]]] = []  # (order_key, end_cs, fmt_lines)
+    slices: list[list] = []  # [start_cs, end_cs, visible_lines_tuple]
+
+    for idx in range(len(boundaries) - 1):
+        t0 = boundaries[idx]
+        t1 = boundaries[idx + 1]
+        if t0 in ends_at:
+            expired = ends_at[t0]
+            active = [item for item in active if item[0] not in expired]
+        if t0 in starts_at:
+            active.extend(sorted(starts_at[t0], key=lambda x: x[0]))
+
+        if t1 <= t0 or not active:
+            continue
+
+        # Take the newest messages that fit within both the message cap and visual-line cap
+        window_msgs = active[-CHAT_MAX_VISIBLE_MESSAGES:]
+        kept_blocks: list[list[str]] = []
+        total_lines = 0
+        for _, _, m_lines in reversed(window_msgs):
+            if kept_blocks and total_lines + len(m_lines) > CHAT_MAX_VISIBLE_LINES:
+                break
+            kept_blocks.append(m_lines)
+            total_lines += len(m_lines)
+        kept_blocks.reverse()
+        visible_lines = tuple(line for blk in kept_blocks for line in blk)
+        if not visible_lines:
+            continue
+
+        # Coalesce consecutive slices with identical visible lines to prevent flicker
+        if slices and slices[-1][1] == t0 and slices[-1][2] == visible_lines:
+            slices[-1][1] = t1
+        else:
+            slices.append([t0, t1, visible_lines])
+
+    panel_x, panel_y, panel_w = 1408, 24, 488
+    text_x, text_y = 1422, 34
+    line_height_px = 28
+
+    header = """[Script Info]
+; Generated by SubTranslate
+Title: YouTube Live Chat Overlay
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: ChatPanel,Sans,22,&H78101014,&H78101014,&H552C2C34,&H00000000,0,0,0,0,100,100,0,0,1,1,0,7,0,0,0,1
+Style: ChatText,Sans,22,&H00F2F2F2,&H00F2F2F2,&H28000000,&H80000000,0,0,0,0,100,100,0,0,1,1.5,0.8,7,0,0,0,1
+Style: Dialogue,Sans,50,&H00FFFFFF,&H00FFFFFF,&H00101010,&H70000000,0,0,0,0,100,100,0,0,1,2.6,1.4,2,60,60,44,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+    dialogue_event_count = 0
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(header)
+        for s_cs, e_cs, vis_lines in slices:
+            s_str = _cs_to_ass_time(s_cs)
+            e_str = _cs_to_ass_time(e_cs)
+            panel_h = len(vis_lines) * line_height_px + 20
+            f.write(
+                f"Dialogue: 0,{s_str},{e_str},ChatPanel,,0,0,0,,"
+                f"{{\\an7\\pos({panel_x},{panel_y})\\p1}}m 0 0 l {panel_w} 0 {panel_w} {panel_h} 0 {panel_h}{{\\p0}}\n"
+            )
+            joined = "\\N".join(vis_lines)
+            f.write(
+                f"Dialogue: 1,{s_str},{e_str},ChatText,,0,0,0,,"
+                f"{{\\an7\\pos({text_x},{text_y})}}{joined}\n"
+            )
+
+        if dialogue_blocks:
+            for blk in dialogue_blocks:
+                raw_txt = blk.translated_text if blk.translated_text else blk.text
+                raw_txt = raw_txt.strip()
+                if not raw_txt:
+                    continue
+                s_cs = round(_srt_to_ms(blk.start_time) / 10)
+                e_cs = round(_srt_to_ms(blk.end_time) / 10)
+                if e_cs <= s_cs:
+                    continue
+                ass_lines = "\\N".join(_escape_ass_text(ln) for ln in raw_txt.splitlines() if ln.strip())
+                if not ass_lines:
+                    continue
+                f.write(
+                    f"Dialogue: 2,{_cs_to_ass_time(s_cs)},{_cs_to_ass_time(e_cs)},Dialogue,,0,0,0,,{ass_lines}\n"
+                )
+                dialogue_event_count += 1
+
+    if dialogue_blocks and dialogue_event_count:
+        print(
+            f"  ✓ Written combined spoken subs ({dialogue_event_count} cues) + chat overlay "
+            f"({len(slices)} windows) to {output_path}"
+        )
+    else:
+        print(f"  ✓ Written synchronized ASS chat overlay ({len(slices)} windows) to {output_path}")
+
+
 # ── Phase 1: Extract & Transcribe ───────────────────────────────────────────
 
 @dataclass
@@ -1005,6 +2154,17 @@ class PendingFile:
     output_srt: Path
     original_srt: Path | None
     blocks: list[SubtitleBlock]
+    source_lang: str
+
+
+@dataclass
+class PendingChatFile:
+    """A YouTube live_chat.json file parsed and queued for translation."""
+    source_path: Path
+    base_stem: str
+    output_json: Path
+    output_ass: Path
+    messages: list[LiveChatMessage]
     source_lang: str
 
 
@@ -1034,16 +2194,44 @@ def _extract_embedded_track(media_path: Path, track: dict) -> list[SubtitleBlock
 def phase1_extract_and_transcribe(
     media_files: list[Path],
     subtitle_files: list[Path],
+    chat_files: list[Path],
     output_dir: Path,
     whisper_model: str = DEFAULT_WHISPER_MODEL,
     ignore_subs: bool = False,
     language: str | None = None,
-) -> list[PendingFile]:
-    """Phase 1: Extract embedded subs or transcribe audio for all files.
+) -> tuple[list[PendingFile], list[PendingChatFile]]:
+    """Phase 1: Extract embedded subs, transcribe audio, and parse chat files.
     Whisper is loaded once and reused across all media files that need it."""
 
     pending: list[PendingFile] = []
+    pending_chat: list[PendingChatFile] = []
     needs_whisper: list[tuple[Path, Path, Path]] = []  # (media_path, wav_path, output_srt)
+
+    # ── Process live chat logs (fast JSONL stream parse, no GPU/Whisper needed) ──
+    for chat_path in chat_files:
+        base_stem = _chat_base_stem(chat_path)
+        output_json = output_dir / f"{base_stem}.en.live_chat.json"
+        output_ass = output_dir / f"{base_stem}.chat.en.ass"
+
+        print(f"\n{'━' * 60}")
+        print(f"  Parsing YouTube Live Chat: {chat_path.name}")
+        print(f"{'━' * 60}")
+
+        try:
+            messages, source_lang = parse_yt_live_chat(chat_path, language_override=language)
+            print(f"  ✓ Parsed {len(messages)} chat item(s) (detected language: {source_lang})")
+            needs_tr = sum(1 for m in messages if m.needs_translation)
+            print(f"  → {needs_tr} message(s) need translation ({len(messages) - needs_tr} emoji/English kept as-is)")
+            pending_chat.append(PendingChatFile(
+                source_path=chat_path,
+                base_stem=base_stem,
+                output_json=output_json,
+                output_ass=output_ass,
+                messages=messages,
+                source_lang=source_lang,
+            ))
+        except Exception as e:
+            print(f"  ✗ Error parsing {chat_path.name}: {e}")
 
     # ── Process media files: check for embedded subs first ──
     for media_path in media_files:
@@ -1159,7 +2347,7 @@ def phase1_extract_and_transcribe(
         except Exception as e:
             print(f"  ✗ Error parsing {sub_path.name}: {e}")
 
-    return pending
+    return pending, pending_chat
 
 
 def _run_whisper(
@@ -1287,17 +2475,24 @@ def _run_whisper(
 
 def phase2_translate_and_write(
     pending: list[PendingFile],
+    pending_chat: list[PendingChatFile] | None = None,
     ollama_model: str = DEFAULT_OLLAMA_MODEL,
     batch_size: int = TRANSLATION_BATCH_SIZE,
+    chat_batch_size: int = CHAT_TRANSLATION_BATCH_SIZE,
+    think: str = "auto",
 ):
-    """Phase 2: Translate all pending subtitle blocks using Ollama.
+    """Phase 2: Translate all pending subtitle blocks and live chat logs using Ollama.
     The model stays loaded across all files."""
 
-    if not pending:
+    pending = pending or []
+    pending_chat = pending_chat or []
+
+    if not pending and not pending_chat:
         return 0, 0
 
+    total_items = len(pending) + len(pending_chat)
     print(f"\n{'━' * 60}")
-    print(f"  ── Translation Phase ({len(pending)} file(s)) ──")
+    print(f"  ── Translation Phase ({total_items} item(s): {len(pending)} subtitle/media, {len(pending_chat)} live chat) ──")
     print(f"{'━' * 60}")
 
     # Save original-language subtitles first so a translation failure never loses the transcription
@@ -1306,13 +2501,14 @@ def phase2_translate_and_write(
             write_srt(pf.blocks, pf.original_srt, use_translated=False)
 
     if not check_ollama(ollama_model):
-        return 0, len(pending)
+        return 0, total_items
 
     success = 0
     failed = 0
 
+    # ── Translate media / subtitle dialogue ──
     for pf in pending:
-        print(f"\n  → Translating: {pf.source_path.name}")
+        print(f"\n  → Translating dialogue: {pf.source_path.name}")
 
         # Skip if already translated (e.g., English embedded subs)
         if all(b.translated_text for b in pf.blocks):
@@ -1321,14 +2517,51 @@ def phase2_translate_and_write(
             continue
 
         try:
-            context = analyze_context(pf.blocks, source_path=pf.source_path, model=ollama_model)
-            translate_blocks(pf.blocks, context, ollama_model, pf.source_lang, batch_size)
+            context = analyze_context(pf.blocks, source_path=pf.source_path, model=ollama_model, think=think)
+            translate_blocks(pf.blocks, context, ollama_model, pf.source_lang, batch_size, think=think)
 
             # Write translated output
             write_srt(pf.blocks, pf.output_srt)
             success += 1
         except Exception as e:
             print(f"  ✗ Translation error for {pf.source_path.name}: {e}")
+            failed += 1
+
+    # ── Translate YouTube live chat logs ──
+    for pcf in pending_chat:
+        print(f"\n  → Translating live chat: {pcf.source_path.name}")
+
+        try:
+            chat_context = analyze_chat_context(
+                pcf.messages,
+                source_path=pcf.source_path,
+                model=ollama_model,
+                think=think,
+            )
+            translate_chat_messages(
+                pcf.messages,
+                context=chat_context,
+                model=ollama_model,
+                source_lang=pcf.source_lang,
+                batch_size=chat_batch_size,
+                think=think,
+            )
+
+            # 1. Write translated JSONL replay file (*.en.live_chat.json)
+            write_translated_live_chat_json(pcf.source_path, pcf.messages, pcf.output_json)
+
+            # 2. Check if there are matching dialogue blocks to combine into the ASS subtitle track
+            matching_pf = next(
+                (pf for pf in pending if _chat_base_stem(pf.source_path) == pcf.base_stem or pf.source_path.stem == pcf.base_stem),
+                None,
+            )
+            dialogue_blocks = matching_pf.blocks if (matching_pf and matching_pf.blocks) else None
+
+            # 3. Write ready-to-play ASS sidebar chat overlay (*.chat.en.ass)
+            write_chat_ass(pcf.messages, pcf.output_ass, dialogue_blocks=dialogue_blocks)
+            success += 1
+        except Exception as e:
+            print(f"  ✗ Translation error for {pcf.source_path.name}: {e}")
             failed += 1
 
     return success, failed
@@ -1338,14 +2571,16 @@ def phase2_translate_and_write(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="SubTranslate — Generate English subtitles from media files",
+        description="SubTranslate — Local Anime & Stream VOD Subtitle/Chat Generator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python subtranslate.py                             Process all files in INPUT/
-  python subtranslate.py --file INPUT/episode.mkv    Process a specific file
-  python subtranslate.py --whisper-model medium       Use smaller/faster model
-  python subtranslate.py --ollama-model llama3.2      Use different LLM
+  python subtranslate.py --file INPUT/episode.mkv    Process a specific anime episode
+  python subtranslate.py --file INPUT/vod.live_chat.json  Translate a stream VOD chat log
+  python subtranslate.py --whisper-model medium       Use smaller/faster Whisper model
+  python subtranslate.py --ollama-model gemma4:31b   Use high-accuracy local LLM
+  python subtranslate.py --think off                 Disable reasoning tokens on thinking models
         """,
     )
     parser.add_argument("--file", "-f", type=Path, help="Process a specific file (or directory) instead of INPUT/")
@@ -1356,11 +2591,15 @@ Examples:
     parser.add_argument("--ollama-model", "-m", default=DEFAULT_OLLAMA_MODEL,
                         help=f"Ollama model for translation (default: {DEFAULT_OLLAMA_MODEL})")
     parser.add_argument("--batch-size", "-b", type=int, default=TRANSLATION_BATCH_SIZE,
-                        help=f"Subtitle lines per translation request (default: {TRANSLATION_BATCH_SIZE})")
+                        help=f"Subtitle dialogue lines per translation request (default: {TRANSLATION_BATCH_SIZE})")
+    parser.add_argument("--chat-batch-size", type=int, default=CHAT_TRANSLATION_BATCH_SIZE,
+                        help=f"Live chat lines per translation request (default: {CHAT_TRANSLATION_BATCH_SIZE})")
+    parser.add_argument("--think", choices=THINK_MODES, default="auto",
+                        help="Thinking/reasoning mode for reasoning LLMs (auto, off, on, low, medium, high; default: auto)")
     parser.add_argument("--transcribe-only", action="store_true",
-                        help="Only transcribe, skip translation")
+                        help="Only transcribe media / parse chat into ASS overlays, skip LLM translation")
     parser.add_argument("--translate-only", action="store_true",
-                        help="Only translate existing subtitle files (media files are skipped)")
+                        help="Only translate existing subtitle or live chat files (media files are skipped)")
     parser.add_argument("--ignore-subs", "-i", action="store_true",
                         help="Ignore embedded subtitle tracks and force Whisper transcription")
     parser.add_argument("--language", "-l", default=None,
@@ -1375,7 +2614,7 @@ Examples:
     # Banner
     print("╔══════════════════════════════════════════════════════╗")
     print("║           SubTranslate                               ║")
-    print("║           Local Anime Subtitle Generator             ║")
+    print("║           Local Anime & Stream Subtitle Generator    ║")
     print("╚══════════════════════════════════════════════════════╝")
     print()
 
@@ -1397,17 +2636,24 @@ Examples:
         files = sorted(args.file.iterdir()) if args.file.is_dir() else [args.file]
     else:
         if not INPUT_DIR.exists():
-            print("✗ INPUT/ directory not found. Create it and add media files.")
+            print("✗ INPUT/ directory not found. Create it and add media or chat files.")
             sys.exit(1)
         files = sorted(INPUT_DIR.iterdir())
 
     # Classify files
-    media_files = [f for f in files if f.suffix.lower() in MEDIA_EXTENSIONS and f.is_file()]
-    subtitle_files = [f for f in files if f.suffix.lower() in SUBTITLE_EXTENSIONS and f.is_file()]
+    chat_files = [f for f in files if is_live_chat_file(f)]
+    media_files = [
+        f for f in files
+        if f.suffix.lower() in MEDIA_EXTENSIONS and f.is_file() and not is_live_chat_file(f)
+    ]
+    subtitle_files = [
+        f for f in files
+        if f.suffix.lower() in SUBTITLE_EXTENSIONS and f.is_file() and not is_live_chat_file(f)
+    ]
 
     ignored = [
         f.name for f in files
-        if f not in media_files and f not in subtitle_files
+        if f not in media_files and f not in subtitle_files and f not in chat_files
         and not f.name.startswith(".") and not f.name.endswith((".context.txt",))
         and f.name not in ("context.txt", "glossary.txt", "glossary.json")
     ]
@@ -1421,32 +2667,42 @@ Examples:
         print(f"→ --transcribe-only: skipping {len(subtitle_files)} subtitle file(s) (nothing to transcribe)")
         subtitle_files = []
 
-    if not media_files and not subtitle_files:
-        print("✗ No supported files found to process.")
+    if not media_files and not subtitle_files and not chat_files:
+        print("✗ No supported media, subtitle, or live chat files found to process.")
         sys.exit(1)
 
-    print(f"→ Found {len(media_files)} media file(s) and {len(subtitle_files)} subtitle file(s)")
+    print(f"→ Found {len(media_files)} media, {len(subtitle_files)} subtitle, and {len(chat_files)} live chat file(s)")
 
-    # ── Phase 1: Extract & Transcribe (Whisper loaded once) ──
-    pending = phase1_extract_and_transcribe(
-        media_files, subtitle_files, output_dir, args.whisper_model,
+    # ── Phase 1: Extract, Transcribe, & Parse (Whisper loaded once) ──
+    pending, pending_chat = phase1_extract_and_transcribe(
+        media_files, subtitle_files, chat_files, output_dir, args.whisper_model,
         ignore_subs=args.ignore_subs,
         language=args.language,
     )
 
     if args.transcribe_only:
-        # Just write the original transcriptions
+        # Write original transcriptions and raw-language chat overlays
         for pf in pending:
             out = pf.original_srt or pf.output_srt
             write_srt(pf.blocks, out, use_translated=False)
+        for pcf in pending_chat:
+            write_chat_ass(pcf.messages, pcf.output_ass)
+        total_done = len(pending) + len(pending_chat)
         print(f"\n{'━' * 60}")
-        print(f"  Done! {len(pending)} file(s) transcribed (translation skipped)")
+        print(f"  Done! {total_done} item(s) transcribed/parsed (translation skipped)")
         print(f"  Output directory: {output_dir.resolve()}")
         print(f"{'━' * 60}")
         return
 
     # ── Phase 2: Translate (Ollama loaded once) ──
-    success, failed = phase2_translate_and_write(pending, args.ollama_model, args.batch_size)
+    success, failed = phase2_translate_and_write(
+        pending,
+        pending_chat,
+        ollama_model=args.ollama_model,
+        batch_size=args.batch_size,
+        chat_batch_size=args.chat_batch_size,
+        think=args.think,
+    )
 
     # Summary
     print(f"\n{'━' * 60}")
